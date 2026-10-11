@@ -858,6 +858,8 @@ class SystemCollector:
                                     "name": item.get("name", f"VM-{item.get('vmid', 0)}"),
                                     "type": "QEMU" if itype == "qemu" else "LXC",
                                     "status": item.get("status", "unknown").upper(),
+                                    "lock": str(item.get("lock", "")).strip().lower() if item.get("lock") else "",
+                                    "qmpstatus": str(item.get("qmpstatus", "")).strip().lower() if item.get("qmpstatus") else "",
                                     "cpu_pct": float(item.get("cpu", 0.0)) * 100.0,
                                     "maxcpu": int(item.get("maxcpu", 1)),
                                     "mem": int(item.get("mem", 0)),
@@ -1022,6 +1024,9 @@ C_BADGE_CYAN = 11   # Cyan pill
 C_BADGE_MAGENTA = 12# Magenta pill
 C_ALERT_RAIN = 13   # Blue/Cyan background for active rain
 C_ALERT_EXTREME = 14# Red background for extreme weather alert
+C_BADGE_REBOOT = 15 # Orange background for rebooting VM [ ↻ REBOOT ]
+C_ROW_ALARM_FLASH = 16 # Pulsing alarm background (White on Red)
+C_ROW_REBOOT = 17   # Orange accent for rebooting VM row
 
 
 def init_colors():
@@ -1041,6 +1046,9 @@ def init_colors():
     curses.init_pair(C_BADGE_MAGENTA, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
     curses.init_pair(C_ALERT_RAIN, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(C_ALERT_EXTREME, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(C_BADGE_REBOOT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(C_ROW_ALARM_FLASH, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(C_ROW_REBOOT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
 
 
 def get_usage_pair(pct, warn=60.0, crit=80.0):
@@ -1443,8 +1451,9 @@ def render_portrait_dashboard(stdscr, collector, data):
     # krimpt wanneer er meer VM's worden toegevoegd.
     # ══════════════════════════════════════════════════════════════════════
     vms = data["vms"]
-    running_vms = sum(1 for v in vms if v["status"] == "RUNNING")
-    stopped_vms = len(vms) - running_vms
+    running_vms = sum(1 for v in vms if v["status"] == "RUNNING" and not (v.get("lock") in ("reboot", "restart") or "reboot" in v["status"].lower() or "reset" in v.get("qmpstatus", "")))
+    rebooting_vms = sum(1 for v in vms if (v.get("lock") in ("reboot", "restart") or "reboot" in v["status"].lower() or "reset" in v.get("qmpstatus", "")))
+    stopped_vms = sum(1 for v in vms if v["status"] in ("STOPPED", "OFFLINE") and not (v.get("lock") in ("reboot", "restart") or "reboot" in v["status"].lower()))
 
     # Reserveer voldoende ruimte voor Server 2 (HA: 11 rows), Server 3 (Pi: 16 rows),
     # en Weer (Banner + Box: minimaal 7 rows) + Footer (1 row) = 35 rijen
@@ -1464,6 +1473,11 @@ def render_portrait_dashboard(stdscr, collector, data):
 
     sec4_h = vm_content_rows + 4
 
+    pve_tag = f"Totaal: {len(vms)} │ Running: {running_vms}"
+    if rebooting_vms > 0:
+        pve_tag += f" │ Reboot: {rebooting_vms}"
+    pve_tag += f" │ Stopped: {stopped_vms}"
+
     draw_box(
         stdscr,
         cur_y,
@@ -1471,7 +1485,7 @@ def render_portrait_dashboard(stdscr, collector, data):
         sec4_h,
         w,
         "SECTIE 4 — PROXMOX VM STATUS",
-        f"Totaal: {len(vms)} │ Running: {running_vms} │ Stopped: {stopped_vms}",
+        pve_tag,
     )
 
     safe_box_str(
@@ -1483,6 +1497,9 @@ def render_portrait_dashboard(stdscr, collector, data):
         c_cyan,
     )
     draw_divider(stdscr, cur_y + 2, 0, w)
+
+    # Flashing effect voor OFFLINE / CRITIEKE VM's (pulserend alarm 2Hz)
+    alarm_flash_on = (int(time.monotonic() * 2) % 2 == 0)
 
     if not vms:
         safe_box_str(
@@ -1507,47 +1524,103 @@ def render_portrait_dashboard(stdscr, collector, data):
         for idx, vm in enumerate(vms[:max_vms_shown]):
             ry1 = cur_y + 3 + (idx * 2)
             ry2 = ry1 + 1
-            is_run = vm["status"] == "RUNNING"
-            ram_pct = min(100.0, (vm["mem"] * 100.0 / vm["maxmem"])) if vm["maxmem"] > 0 else 0.0
-            up_str = format_uptime(vm["uptime"]) if is_run else "Gestopt"
 
-            # Line 1 of VM card: ID, Name, Status Pill (GROEN = ONLINE / ROOD = OFFLINE)
-            safe_box_str(stdscr, ry1, 3, max_x, f"#{vm['vmid']:<6}", c_white)
-            safe_box_str(stdscr, ry1, 11, max_x, "│ ", c_grey)
-            safe_box_str(stdscr, ry1, 13, max_x, f"{vm['name'][:20]:<20}", c_white)
-            safe_box_str(stdscr, ry1, 36, max_x, "│ ", c_grey)
-            if is_run:
+            v_raw_status = vm.get("status", "UNKNOWN").upper()
+            v_lock = vm.get("lock", "")
+            v_qmp = vm.get("qmpstatus", "")
+
+            # Detecteer rebooting, offline, en kritieke toestand
+            is_rebooting = (
+                v_lock in ("reboot", "restart")
+                or "reboot" in v_raw_status.lower()
+                or "reset" in v_qmp
+            )
+            is_offline = (
+                v_raw_status in ("STOPPED", "OFFLINE")
+                and not is_rebooting
+            )
+            is_crit = (
+                (vm["cpu_pct"] >= 95.0 or (vm["maxmem"] > 0 and (vm["mem"] * 100.0 / vm["maxmem"]) >= 95.0))
+                and not is_offline
+                and not is_rebooting
+            )
+            is_run = (v_raw_status == "RUNNING" and not is_rebooting)
+
+            ram_pct = min(100.0, (vm["mem"] * 100.0 / vm["maxmem"])) if vm["maxmem"] > 0 else 0.0
+            if is_rebooting:
+                up_str = "Herstarten..."
+            elif is_run:
+                up_str = format_uptime(vm["uptime"])
+            else:
+                up_str = "Gestopt"
+
+            # Achtergrond styling:
+            # - Rebooting: hele regel oranje achtergrond
+            # - Offline / Kritiek: pulsend flashy alarm (rood/wit flitsend)
+            if is_offline or is_crit:
+                card_bg = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else 0
+            elif is_rebooting:
+                card_bg = curses.color_pair(C_ROW_REBOOT) | curses.A_BOLD
+            else:
+                card_bg = 0
+
+            if card_bg:
+                row_fill = " " * max(0, w - 4)
+                safe_addstr(stdscr, ry1, 2, row_fill, card_bg)
+                safe_addstr(stdscr, ry2, 2, row_fill, card_bg)
+
+            # Line 1 of VM card: ID, Name, Status Pill
+            id_col = card_bg if card_bg else c_white
+            pipe_col = card_bg if card_bg else c_grey
+            name_col = card_bg if card_bg else c_white
+
+            safe_box_str(stdscr, ry1, 3, max_x, f"#{vm['vmid']:<6}", id_col)
+            safe_box_str(stdscr, ry1, 11, max_x, "│ ", pipe_col)
+            safe_box_str(stdscr, ry1, 13, max_x, f"{vm['name'][:20]:<20}", name_col)
+            safe_box_str(stdscr, ry1, 36, max_x, "│ ", pipe_col)
+
+            if is_rebooting:
+                safe_box_str(stdscr, ry1, 38, max_x, " ↻ REBOOT  ", curses.color_pair(C_BADGE_REBOOT) | curses.A_BOLD)
+            elif is_offline:
+                badge_style = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else (curses.color_pair(C_BADGE_OFFLINE) | curses.A_BOLD)
+                safe_box_str(stdscr, ry1, 38, max_x, " ⚠ OFFLINE ", badge_style)
+            elif is_crit:
+                badge_style = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else (curses.color_pair(C_ALERT_EXTREME) | curses.A_BOLD)
+                safe_box_str(stdscr, ry1, 38, max_x, " ! CRITIEK ", badge_style)
+            elif is_run:
                 safe_box_str(stdscr, ry1, 38, max_x, " ● RUNNING ", curses.color_pair(C_BADGE_ONLINE) | curses.A_BOLD)
             else:
-                safe_box_str(stdscr, ry1, 38, max_x, " ○ STOPPED ", curses.color_pair(C_BADGE_OFFLINE) | curses.A_BOLD)
+                safe_box_str(stdscr, ry1, 38, max_x, f" ○ {v_raw_status[:7]:<7} ", curses.color_pair(C_BADGE_OFFLINE) | curses.A_BOLD)
 
+            meta_style = card_bg if card_bg else (c_white if is_run else c_grey)
             safe_box_str(
                 stdscr,
                 ry1,
                 50,
                 max_x,
                 f"│ {vm['type']} ({vm['maxcpu']} vCPU) │ Uptime: {up_str}",
-                c_white if is_run else c_grey,
+                meta_style,
             )
 
-            # Line 2 of VM card: CPU & RAM Bars (Groen <60%, Oranje 60-80%, Rood >80%)
-            safe_box_str(stdscr, ry2, 3, max_x, "        │ ", c_grey)
-            safe_box_str(stdscr, ry2, 13, max_x, "CPU:", c_grey)
+            # Line 2 of VM card: CPU & RAM Bars
+            safe_box_str(stdscr, ry2, 3, max_x, "        │ ", pipe_col)
+            safe_box_str(stdscr, ry2, 13, max_x, "CPU:", card_bg if card_bg else c_grey)
             draw_bar(stdscr, ry2, 18, v_bar_w, vm["cpu_pct"])
             cx = 19 + v_bar_w
-            vm_cpu_col = get_usage_pair(vm["cpu_pct"]) | curses.A_BOLD
+            vm_cpu_col = card_bg if card_bg else (get_usage_pair(vm["cpu_pct"]) | curses.A_BOLD)
             safe_box_str(stdscr, ry2, cx, max_x, f"{vm['cpu_pct']:5.1f}%", vm_cpu_col)
-            safe_box_str(stdscr, ry2, cx + 7, max_x, "│ RAM:", c_grey)
+            safe_box_str(stdscr, ry2, cx + 7, max_x, "│ RAM:", pipe_col)
             rx = cx + 15
             draw_bar(stdscr, ry2, rx, v_bar_w, ram_pct)
-            vm_ram_col = get_usage_pair(ram_pct) | curses.A_BOLD
+            vm_ram_col = card_bg if card_bg else (get_usage_pair(ram_pct) | curses.A_BOLD)
+            mem_label_col = card_bg if card_bg else c_white
             safe_box_str(
                 stdscr,
                 ry2,
                 rx + v_bar_w + 1,
                 max_x,
                 f"{format_bytes(vm['mem'], 1)} / {format_bytes(vm['maxmem'], 1)} (",
-                c_white,
+                mem_label_col,
             )
             safe_box_str(
                 stdscr,
@@ -1563,25 +1636,73 @@ def render_portrait_dashboard(stdscr, collector, data):
                 rx + v_bar_w + 1 + len(f"{format_bytes(vm['mem'], 1)} / {format_bytes(vm['maxmem'], 1)} (") + len(f"{ram_pct:3.0f}%"),
                 max_x,
                 ")",
-                c_white,
+                mem_label_col,
             )
     else:
         max_vms_shown = sec4_h - 4
         for idx, vm in enumerate(vms[:max_vms_shown]):
             ry = cur_y + 3 + idx
-            is_run = vm["status"] == "RUNNING"
+            v_raw_status = vm.get("status", "UNKNOWN").upper()
+            v_lock = vm.get("lock", "")
+            v_qmp = vm.get("qmpstatus", "")
+
+            is_rebooting = (
+                v_lock in ("reboot", "restart")
+                or "reboot" in v_raw_status.lower()
+                or "reset" in v_qmp
+            )
+            is_offline = (
+                v_raw_status in ("STOPPED", "OFFLINE")
+                and not is_rebooting
+            )
+            is_crit = (
+                (vm["cpu_pct"] >= 95.0 or (vm["maxmem"] > 0 and (vm["mem"] * 100.0 / vm["maxmem"]) >= 95.0))
+                and not is_offline
+                and not is_rebooting
+            )
+            is_run = (v_raw_status == "RUNNING" and not is_rebooting)
+
             ram_pct = (vm["mem"] * 100.0 / vm["maxmem"]) if vm["maxmem"] > 0 else 0.0
-            safe_box_str(stdscr, ry, 3, max_x, f"#{vm['vmid']:<6}", c_white)
-            safe_box_str(stdscr, ry, 11, max_x, f"│ {vm['name'][:20]:<20} │ ", c_white)
-            if is_run:
+
+            if is_offline or is_crit:
+                card_bg = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else 0
+            elif is_rebooting:
+                card_bg = curses.color_pair(C_ROW_REBOOT) | curses.A_BOLD
+            else:
+                card_bg = 0
+
+            if card_bg:
+                row_fill = " " * max(0, w - 4)
+                safe_addstr(stdscr, ry, 2, row_fill, card_bg)
+
+            id_col = card_bg if card_bg else c_white
+            pipe_col = card_bg if card_bg else c_white
+            name_col = card_bg if card_bg else c_white
+
+            safe_box_str(stdscr, ry, 3, max_x, f"#{vm['vmid']:<6}", id_col)
+            safe_box_str(stdscr, ry, 11, max_x, f"│ {vm['name'][:20]:<20} │ ", pipe_col)
+
+            if is_rebooting:
+                safe_box_str(stdscr, ry, 38, max_x, " ↻ REB ", curses.color_pair(C_BADGE_REBOOT) | curses.A_BOLD)
+            elif is_offline:
+                badge_style = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else (curses.color_pair(C_BADGE_OFFLINE) | curses.A_BOLD)
+                safe_box_str(stdscr, ry, 38, max_x, " ⚠ OFF ", badge_style)
+            elif is_crit:
+                badge_style = (curses.color_pair(C_ROW_ALARM_FLASH) | curses.A_BOLD) if alarm_flash_on else (curses.color_pair(C_ALERT_EXTREME) | curses.A_BOLD)
+                safe_box_str(stdscr, ry, 38, max_x, " ! CRT ", badge_style)
+            elif is_run:
                 safe_box_str(stdscr, ry, 38, max_x, " ● RUN ", curses.color_pair(C_BADGE_ONLINE) | curses.A_BOLD)
             else:
                 safe_box_str(stdscr, ry, 38, max_x, " ○ STP ", curses.color_pair(C_BADGE_OFFLINE) | curses.A_BOLD)
 
-            safe_box_str(stdscr, ry, 46, max_x, "│ CPU: ", c_grey)
-            safe_box_str(stdscr, ry, 53, max_x, f"{vm['cpu_pct']:5.1f}%", get_usage_pair(vm["cpu_pct"]) | curses.A_BOLD)
-            safe_box_str(stdscr, ry, 60, max_x, f"│ RAM: {format_bytes(vm['mem'], 1)}/{format_bytes(vm['maxmem'], 1)} (", c_grey)
-            safe_box_str(stdscr, ry, 82, max_x, f"{ram_pct:3.0f}%)", get_usage_pair(ram_pct) | curses.A_BOLD)
+            cpu_val_col = card_bg if card_bg else (get_usage_pair(vm["cpu_pct"]) | curses.A_BOLD)
+            ram_val_col = card_bg if card_bg else (get_usage_pair(ram_pct) | curses.A_BOLD)
+            lbl_col = card_bg if card_bg else c_grey
+
+            safe_box_str(stdscr, ry, 46, max_x, "│ CPU: ", lbl_col)
+            safe_box_str(stdscr, ry, 53, max_x, f"{vm['cpu_pct']:5.1f}%", cpu_val_col)
+            safe_box_str(stdscr, ry, 60, max_x, f"│ RAM: {format_bytes(vm['mem'], 1)}/{format_bytes(vm['maxmem'], 1)} (", lbl_col)
+            safe_box_str(stdscr, ry, 82, max_x, f"{ram_pct:3.0f}%)", ram_val_col)
 
     cur_y += sec4_h
 
@@ -1979,11 +2100,33 @@ def main(stdscr):
     last_update = time.monotonic()
     render_portrait_dashboard(stdscr, collector, data)
 
+    last_flash_state = -1
+
     while True:
         now = time.monotonic()
+        # Fast animation frame check for pulsing alarms (weather and VM offline/critical)
+        current_flash_state = int(now * 2) % 2
+        needs_render = False
+
         if now - last_update >= REFRESH_INTERVAL:
             data = collector.collect()
             last_update = now
+            needs_render = True
+        elif current_flash_state != last_flash_state:
+            # Check of er een pulserend alarm actief is
+            has_alarm = (
+                data.get("weather", {}).get("is_extreme", False)
+                or any(
+                    (v.get("status", "").upper() in ("STOPPED", "OFFLINE") and not (v.get("lock") in ("reboot", "restart") or "reboot" in v.get("status", "").lower()))
+                    or (v.get("cpu_pct", 0) >= 95.0 or (v.get("maxmem", 0) > 0 and (v.get("mem", 0) * 100.0 / v.get("maxmem", 1)) >= 95.0))
+                    for v in data.get("vms", [])
+                )
+            )
+            if has_alarm:
+                needs_render = True
+
+        if needs_render:
+            last_flash_state = current_flash_state
             render_portrait_dashboard(stdscr, collector, data)
 
         ch = stdscr.getch()
