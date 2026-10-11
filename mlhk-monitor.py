@@ -1883,7 +1883,8 @@ def render_portrait_dashboard(stdscr, collector, data):
     s_rendered = 0
     if plex_streams or jelly_streams:
         for ps in plex_streams[:2]:
-            s_line = f"  ▶ PLEX │ {ps.get('user', 'User')} @ {ps.get('device', 'Device')}: {ps.get('title', 'Titel')} [{ps.get('state', 'Direct Play')}]"
+            pct_str = f" ({ps.get('pct', 0.0):.0f}%)" if ps.get('pct') is not None else ""
+            s_line = f"  ▶ PLEX │ {ps.get('user', 'User')} @ {ps.get('device', 'Device')}: {ps.get('title', 'Titel')} [{ps.get('state', 'Direct Play')}{pct_str}]"
             safe_box_str(stdscr, cur_y + 5 + s_rendered, 3, max_x, s_line, curses.color_pair(C_GREEN) | curses.A_BOLD)
             s_rendered += 1
         if s_rendered < 2 and jelly_streams:

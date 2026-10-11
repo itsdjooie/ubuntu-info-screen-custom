@@ -77,21 +77,60 @@ except Exception:
 # Rich Plex Stream Details via local Plex Media Server API
 plex_streams = []
 token = None
+
+# Check cache file in home dir
+token_cache_file = os.path.expanduser("~/.config/plex_token.txt")
 try:
-    files = glob.glob("/var/lib/plexmediaserver/**/Preferences.xml", recursive=True)
-    for f in files:
-        try:
-            with open(f) as fp:
-                for part in fp.read().split():
-                    if part.startswith("PlexOnlineToken="):
-                        token = part.split('"')[1]
-                        break
-        except Exception:
-            pass
-        if token:
-            break
+    if os.path.exists(token_cache_file):
+        with open(token_cache_file, "r") as cf:
+            c_tok = cf.read().strip()
+            if c_tok:
+                token = c_tok
 except Exception:
     pass
+
+if not token:
+    try:
+        files = glob.glob("/var/lib/plexmediaserver/**/Preferences.xml", recursive=True)
+        for f in files:
+            try:
+                with open(f) as fp:
+                    for part in fp.read().split():
+                        if part.startswith("PlexOnlineToken="):
+                            token = part.split('"')[1]
+                            break
+            except Exception:
+                pass
+            if token:
+                break
+    except Exception:
+        pass
+
+# Fallback: if permission denied for molhoek, read Preferences.xml via sudo -n
+if not token:
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", "cat", "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if res.returncode == 0:
+            for part in res.stdout.split():
+                if part.startswith("PlexOnlineToken="):
+                    token = part.split('"')[1]
+                    break
+    except Exception:
+        pass
+
+# If found, persist in cache so sudo isn't even needed next time
+if token:
+    try:
+        os.makedirs(os.path.dirname(token_cache_file), exist_ok=True)
+        with open(token_cache_file, "w") as cf:
+            cf.write(token)
+    except Exception:
+        pass
 
 if token:
     try:
