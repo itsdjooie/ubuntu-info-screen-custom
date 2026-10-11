@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Configuration & Secrets
+*.token
+*.key
+pve-token.json
+token.json
+.config/
+
+# OS & Logs
+.DS_Store
+Thumbs.db
+*.log
