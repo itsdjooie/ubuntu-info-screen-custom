@@ -188,8 +188,10 @@ class SystemCollector:
             "temp": 0.0,
             "mem": {"total": 1, "used": 0, "pct": 0.0},
             "disks": [],
-            "plex_streams": 0,
-            "jelly_streams": 0,
+            "plex_count": 0,
+            "plex_streams": [],
+            "jelly_count": 0,
+            "jelly_streams": [],
             "online": False,
         }
         self.pi5_lock = threading.Lock()
@@ -692,9 +694,17 @@ class SystemCollector:
         samsung_free = max(0, samsung_total - samsung_used)
         samsung_pct = (samsung_used * 100.0 / samsung_total) if samsung_total > 0 else 0.0
 
-        # Fysieke Schijf 2: Kingston SSD 240GB
+        # Fysieke Schijf 2: Kingston SSD 240GB (Proxmox Thinpool 'kingston-ssd')
         kingston_total = 240057409536  # 240 GB
-        kingston_used = 136365211648   # 127.0 GB
+        kingston_used = 35479622988    # 33.0 GB baseline
+        try:
+            for s in pve_storages:
+                if s.get("storage") == "kingston-ssd":
+                    kingston_used = s.get("disk", kingston_used)
+                    if s.get("maxdisk", 0) > 0:
+                        kingston_total = s.get("maxdisk")
+        except Exception:
+            pass
         kingston_free = max(0, kingston_total - kingston_used)
         kingston_pct = (kingston_used * 100.0 / kingston_total) if kingston_total > 0 else 0.0
 
@@ -1817,13 +1827,26 @@ def render_portrait_dashboard(stdscr, collector, data):
     cur_y += 1
 
     # ══════════════════════════════════════════════════════════════════════
-    # SECTIE 6 — BETASERVER MEDIA NODE (15 rows)
+    # SECTIE 6 — BETASERVER MEDIA NODE (Dynamische hoogte)
     # ══════════════════════════════════════════════════════════════════════
-    sec6_h = 15
     pi = data.get("pi5", {})
     is_pi_online = pi.get("online", False)
     status_badge = " ● ONLINE " if is_pi_online else " ○ OFFLINE "
     badge_color = curses.color_pair(C_BADGE_ONLINE) if is_pi_online else curses.color_pair(C_BADGE_OFFLINE)
+
+    plex_streams = pi.get("plex_streams", [])
+    if not isinstance(plex_streams, list):
+        plex_streams = []
+    jelly_streams = pi.get("jelly_streams", [])
+    if not isinstance(jelly_streams, list):
+        jelly_streams = []
+    pi_disks = pi.get("disks", [])
+    if not isinstance(pi_disks, list):
+        pi_disks = []
+    num_stream_rows = max(1, min(2, len(plex_streams) + len(jelly_streams)))
+    num_disk_rows = min(4, len(pi_disks))
+    # 1 (header) + 2 (node/load) + 1 (divider) + 1 (stream badge) + num_stream_rows + 1 (divider) + 1 (disk title) + num_disk_rows + 1 (bottom border) = 8 + rows
+    sec6_h = 8 + num_stream_rows + num_disk_rows
 
     draw_box(
         stdscr,
