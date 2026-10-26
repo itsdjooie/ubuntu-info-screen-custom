@@ -403,8 +403,8 @@ class SystemCollector:
                                 self.door_opened_at = None
                             open_duration = 0
 
-                        # Melding triggert als voordeur minimaal 10 minuten (600 seconden) open staat
-                        is_active_open_alert = is_door_open and (open_duration >= 600)
+                        # De melding triggert direct zodra de voordeur open staat (0 sec)
+                        is_active_open_alert = is_door_open
                         if is_active_open_alert:
                             self.had_door_alert = True
 
@@ -2166,19 +2166,29 @@ def render_portrait_dashboard(stdscr, collector, data):
             rendered_days += 1
 
     # ══════════════════════════════════════════════════════════════════════
-    # POPUP OVERLAY — VOORDEUR ALARM (Als deur >= 10 minuten open staat)
+    # POPUP OVERLAY — VOORDEUR ALARM (Direct bij opening + escalatie na 10m & 20m)
     # ══════════════════════════════════════════════════════════════════════
     ha_info = data.get("ha", {})
     if ha_info.get("door_open_alert", False):
-        d_secs = ha_info.get("door_open_seconds", 600)
+        d_secs = ha_info.get("door_open_seconds", 0)
         dm, ds = divmod(d_secs, 60)
         just_closed = ha_info.get("door_just_closed", False)
         closed_cd = ha_info.get("door_closed_countdown", 0)
 
-        pop_w = min(74, w - 4)
-        pop_h = 11
+        # Escalatie niveau berekenen:
+        # Niveau 0: 0 - 10 min (Standaard waarschuwing)
+        # Niveau 1: 10 - 20 min (Escalatie 1: sneller knipperen 4Hz, groter formaat)
+        # Niveau 2: >= 20 min (Escalatie 2: max opvallend, dubbele flits + waarschuwingsblokken)
+        escalation_level = 0
+        if d_secs >= 1200:
+            escalation_level = 2
+        elif d_secs >= 600:
+            escalation_level = 1
+
+        pop_w = min(76 if escalation_level >= 1 else 72, w - 4)
+        pop_h = 13 if escalation_level >= 1 else 11
         pop_x = max(2, (w - pop_w) // 2)
-        pop_y = max(4, (h - pop_h) // 2)
+        pop_y = max(3, (h - pop_h) // 2)
 
         if just_closed:
             # Groen geruststellend effect bij sluiting (telt af en sluit na max 5s)
@@ -2189,14 +2199,27 @@ def render_portrait_dashboard(stdscr, collector, data):
             line3 = f"DEZE MELDING SLUIT AUTOMATISCH OVER {closed_cd}s..."
             line4 = "MLHK TOEGANGSBEVEILIGING HERSTELD"
         else:
-            # Knipper effect (2 Hz)
-            is_flash = (int(time.time() * 2) % 2 == 0)
+            # Flitsfrequentie: Niveau 0 = 2 Hz, Niveau 1 & 2 = 4 Hz (extra opvallend)
+            flash_rate = 4.0 if escalation_level >= 1 else 2.0
+            is_flash = (int(time.time() * flash_rate) % 2 == 0)
             pop_col = curses.color_pair(C_DOOR_POPUP_RED) if is_flash else curses.color_pair(C_DOOR_POPUP_AMBER)
             pop_attr = pop_col | curses.A_BOLD
-            line1 = "⚠️   ALARM: VOORDEUR STAAT OPEN!   ⚠️"
-            line2 = f"CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt)"
-            line3 = f"DUUR: AL MEER DAN {dm} MINUTEN EN {ds:02d} SECONDEN OPEN!"
-            line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
+
+            if escalation_level == 2:
+                line1 = "🚨🚨🚨 KRITIEK: VOORDEUR AL MEER DAN 20 MINUTEN OPEN! 🚨🚨🚨"
+                line2 = "CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt) — ESCALATIE 2"
+                line3 = f"TOTALE OPENSTAANDE TIJD: {dm:02d}:{ds:02d} — DRINGEND SLUITEN!"
+                line4 = "⚠️ CONTROLEER DIRECT OF DE DEUR NIET OPEN WAAIT OF INBRAAK PLAATSVINDT ⚠️"
+            elif escalation_level == 1:
+                line1 = "⚠️⚠️  OPGELET: VOORDEUR AL MEER DAN 10 MINUTEN OPEN!  ⚠️⚠️"
+                line2 = "CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt) — ESCALATIE 1"
+                line3 = f"OPENSTAANDE TIJD: {dm:02d} MINUTEN EN {ds:02d} SECONDEN"
+                line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
+            else:
+                line1 = "⚠️   ALARM: VOORDEUR GEOPEND!   ⚠️"
+                line2 = "CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt)"
+                line3 = f"STATUS: DEUR IS OPEN — LIVE TIJD: {dm:02d}:{ds:02d}"
+                line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
 
         # Achtergrond en rand vullen
         for py in range(pop_y, pop_y + pop_h):
@@ -2210,10 +2233,11 @@ def render_portrait_dashboard(stdscr, collector, data):
             safe_addstr(stdscr, py, pop_x + pop_w - 1, "║", pop_attr)
         safe_addstr(stdscr, pop_y + pop_h - 1, pop_x, border_bot, pop_attr)
 
-        safe_addstr(stdscr, pop_y + 2, pop_x + max(1, (pop_w - len(line1)) // 2), line1, pop_attr)
-        safe_addstr(stdscr, pop_y + 4, pop_x + max(1, (pop_w - len(line2)) // 2), line2, pop_attr)
-        safe_addstr(stdscr, pop_y + 6, pop_x + max(1, (pop_w - len(line3)) // 2), line3, pop_attr)
-        safe_addstr(stdscr, pop_y + 8, pop_x + max(1, (pop_w - len(line4)) // 2), line4, pop_attr)
+        y_offset = 2 if pop_h == 11 else 3
+        safe_addstr(stdscr, pop_y + y_offset, pop_x + max(1, (pop_w - len(line1)) // 2), line1, pop_attr)
+        safe_addstr(stdscr, pop_y + y_offset + 2, pop_x + max(1, (pop_w - len(line2)) // 2), line2, pop_attr)
+        safe_addstr(stdscr, pop_y + y_offset + 4, pop_x + max(1, (pop_w - len(line3)) // 2), line3, pop_attr)
+        safe_addstr(stdscr, pop_y + y_offset + 6, pop_x + max(1, (pop_w - len(line4)) // 2), line4, pop_attr)
 
     # ══════════════════════════════════════════════════════════════════════
     # ONDERAAN — FOOTER BALK (1 row)
