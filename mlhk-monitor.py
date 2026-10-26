@@ -217,8 +217,12 @@ class SystemCollector:
             "door_open": False,
             "door_open_seconds": 0,
             "door_open_alert": False,
+            "door_just_closed": False,
+            "door_closed_countdown": 0,
         }
         self.door_opened_at = None
+        self.door_closed_at = None
+        self.had_door_alert = False
         self.ha_lock = threading.Lock()
         self.ha_thread = threading.Thread(target=self._ha_worker, daemon=True)
         self.ha_thread.start()
@@ -389,12 +393,34 @@ class SystemCollector:
                                 if not self.door_opened_at:
                                     self.door_opened_at = now_ts
                                 open_duration = int(now_ts - self.door_opened_at)
+                            self.door_closed_at = None
                         else:
-                            self.door_opened_at = None
+                            # Deur is dicht
+                            if self.door_opened_at is not None:
+                                # Overgang van open naar dicht
+                                if self.had_door_alert:
+                                    self.door_closed_at = now_ts
+                                self.door_opened_at = None
                             open_duration = 0
 
                         # Melding triggert als voordeur minimaal 10 minuten (600 seconden) open staat
-                        door_alert = is_door_open and (open_duration >= 600)
+                        is_active_open_alert = is_door_open and (open_duration >= 600)
+                        if is_active_open_alert:
+                            self.had_door_alert = True
+
+                        # Als de alert actief was en de deur is nu dicht, toon popup maximaal 5 seconden na sluiting
+                        just_closed = False
+                        closed_countdown = 0
+                        if not is_door_open and self.had_door_alert and self.door_closed_at:
+                            elapsed_since_closed = now_ts - self.door_closed_at
+                            if elapsed_since_closed <= 5.0:
+                                just_closed = True
+                                closed_countdown = max(1, int(5.0 - elapsed_since_closed))
+                            else:
+                                self.had_door_alert = False
+                                self.door_closed_at = None
+
+                        door_alert = is_active_open_alert or just_closed
 
                         with self.ha_lock:
                             self.ha_data = {
@@ -415,6 +441,8 @@ class SystemCollector:
                                 "door_open": is_door_open,
                                 "door_open_seconds": open_duration,
                                 "door_open_alert": door_alert,
+                                "door_just_closed": just_closed,
+                                "door_closed_countdown": closed_countdown,
                             }
                     else:
                         with self.ha_lock:
@@ -2144,15 +2172,31 @@ def render_portrait_dashboard(stdscr, collector, data):
     if ha_info.get("door_open_alert", False):
         d_secs = ha_info.get("door_open_seconds", 600)
         dm, ds = divmod(d_secs, 60)
+        just_closed = ha_info.get("door_just_closed", False)
+        closed_cd = ha_info.get("door_closed_countdown", 0)
+
         pop_w = min(74, w - 4)
         pop_h = 11
         pop_x = max(2, (w - pop_w) // 2)
         pop_y = max(4, (h - pop_h) // 2)
 
-        # Knipper effect (2 Hz)
-        is_flash = (int(time.time() * 2) % 2 == 0)
-        pop_col = curses.color_pair(C_DOOR_POPUP_RED) if is_flash else curses.color_pair(C_DOOR_POPUP_AMBER)
-        pop_attr = pop_col | curses.A_BOLD
+        if just_closed:
+            # Groen geruststellend effect bij sluiting (telt af en sluit na max 5s)
+            pop_col = curses.color_pair(C_BADGE_ONLINE)
+            pop_attr = pop_col | curses.A_BOLD
+            line1 = "✓   VOORDEUR WEER GESLOTEN!   ✓"
+            line2 = "STATUS: DEUR IS GOED IN HET SLOT GEVALLEN"
+            line3 = f"DEZE MELDING SLUIT AUTOMATISCH OVER {closed_cd}s..."
+            line4 = "MLHK TOEGANGSBEVEILIGING HERSTELD"
+        else:
+            # Knipper effect (2 Hz)
+            is_flash = (int(time.time() * 2) % 2 == 0)
+            pop_col = curses.color_pair(C_DOOR_POPUP_RED) if is_flash else curses.color_pair(C_DOOR_POPUP_AMBER)
+            pop_attr = pop_col | curses.A_BOLD
+            line1 = "⚠️   ALARM: VOORDEUR STAAT OPEN!   ⚠️"
+            line2 = f"CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt)"
+            line3 = f"DUUR: AL MEER DAN {dm} MINUTEN EN {ds:02d} SECONDEN OPEN!"
+            line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
 
         # Achtergrond en rand vullen
         for py in range(pop_y, pop_y + pop_h):
@@ -2165,11 +2209,6 @@ def render_portrait_dashboard(stdscr, collector, data):
             safe_addstr(stdscr, py, pop_x, "║", pop_attr)
             safe_addstr(stdscr, py, pop_x + pop_w - 1, "║", pop_attr)
         safe_addstr(stdscr, pop_y + pop_h - 1, pop_x, border_bot, pop_attr)
-
-        line1 = "⚠️   ALARM: VOORDEUR STAAT OPEN!   ⚠️"
-        line2 = f"CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt)"
-        line3 = f"DUUR: AL MEER DAN {dm} MINUTEN EN {ds:02d} SECONDEN OPEN!"
-        line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
 
         safe_addstr(stdscr, pop_y + 2, pop_x + max(1, (pop_w - len(line1)) // 2), line1, pop_attr)
         safe_addstr(stdscr, pop_y + 4, pop_x + max(1, (pop_w - len(line2)) // 2), line2, pop_attr)
