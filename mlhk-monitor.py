@@ -214,7 +214,11 @@ class SystemCollector:
             "wasmachine_state": "Uit",
             "droger_state": "Uit",
             "weather": "Onbekend",
+            "door_open": False,
+            "door_open_seconds": 0,
+            "door_open_alert": False,
         }
+        self.door_opened_at = None
         self.ha_lock = threading.Lock()
         self.ha_thread = threading.Thread(target=self._ha_worker, daemon=True)
         self.ha_thread.start()
@@ -364,6 +368,34 @@ class SystemCollector:
                         w_ent = data_map.get("weather.forecast_thuis") or data_map.get("weather.buienradar")
                         w_state = w_ent.get("state", "Onbekend") if w_ent else "Onbekend"
 
+                        # Contact Sensor Voordeur (Tuya / Home Assistant)
+                        door_ent = data_map.get("binary_sensor.voordeur_sensor_deur")
+                        door_state = door_ent.get("state") if door_ent else "off"
+                        is_door_open = (door_state == "on")
+
+                        now_ts = time.time()
+                        if is_door_open:
+                            # Gebruik de daadwerkelijke last_changed timestamp uit Home Assistant indien beschikbaar
+                            ha_last_changed = door_ent.get("last_changed")
+                            if ha_last_changed:
+                                try:
+                                    dt_c = datetime.fromisoformat(ha_last_changed.replace("Z", "+00:00"))
+                                    open_duration = max(0, int(now_ts - dt_c.timestamp()))
+                                except Exception:
+                                    if not self.door_opened_at:
+                                        self.door_opened_at = now_ts
+                                    open_duration = int(now_ts - self.door_opened_at)
+                            else:
+                                if not self.door_opened_at:
+                                    self.door_opened_at = now_ts
+                                open_duration = int(now_ts - self.door_opened_at)
+                        else:
+                            self.door_opened_at = None
+                            open_duration = 0
+
+                        # Melding triggert als voordeur minimaal 10 minuten (600 seconden) open staat
+                        door_alert = is_door_open and (open_duration >= 600)
+
                         with self.ha_lock:
                             self.ha_data = {
                                 "online": True,
@@ -380,6 +412,9 @@ class SystemCollector:
                                 "wasmachine_state": wm_st,
                                 "droger_state": dr_st,
                                 "weather": w_state,
+                                "door_open": is_door_open,
+                                "door_open_seconds": open_duration,
+                                "door_open_alert": door_alert,
                             }
                     else:
                         with self.ha_lock:
@@ -1037,6 +1072,8 @@ C_ALERT_EXTREME = 14# Red background for extreme weather alert
 C_BADGE_REBOOT = 15 # Orange background for rebooting VM [ ↻ REBOOT ]
 C_ROW_ALARM_FLASH = 16 # Pulsing alarm background (White on Red)
 C_ROW_REBOOT = 17   # Orange accent for rebooting VM row
+C_DOOR_POPUP_RED = 18    # Flash 1 for Door popup (White on Red)
+C_DOOR_POPUP_AMBER = 19  # Flash 2 for Door popup (Black on Yellow/Orange)
 
 
 def init_colors():
@@ -1059,6 +1096,8 @@ def init_colors():
     curses.init_pair(C_BADGE_REBOOT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
     curses.init_pair(C_ROW_ALARM_FLASH, curses.COLOR_WHITE, curses.COLOR_RED)
     curses.init_pair(C_ROW_REBOOT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(C_DOOR_POPUP_RED, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(C_DOOR_POPUP_AMBER, curses.COLOR_BLACK, curses.COLOR_YELLOW)
 
 
 def get_usage_pair(pct, warn=60.0, crit=80.0):
@@ -1803,18 +1842,28 @@ def render_portrait_dashboard(stdscr, collector, data):
     safe_box_str(stdscr, cur_y + 7, 3, max_x, "KLIMAAT BINNEN:", c_white)
     safe_box_str(stdscr, cur_y + 7, 19, max_x, f"Woonkamer: {t_str} │ Vochtigheid: {h_str} RV", c_cyan)
 
-    # Row 8: Huishoudelijke Apparatuur
+    # Row 8: Huishoudelijke Apparatuur & Contactsensoren
     wm_st = ha.get("wasmachine_state", "Uit")
     dr_st = ha.get("droger_state", "Uit")
     b_pow = ha.get("boiler_power", 0.0)
+    door_is_open = ha.get("door_open", False)
+    door_secs = ha.get("door_open_seconds", 0)
     wm_col = curses.color_pair(C_BADGE_ONLINE) if wm_st == "Draait" else curses.color_pair(C_GREY)
     dr_col = curses.color_pair(C_BADGE_ONLINE) if dr_st == "Draait" else curses.color_pair(C_GREY)
-    safe_box_str(stdscr, cur_y + 8, 3, max_x, "APPARATUUR    :", c_white)
+    safe_box_str(stdscr, cur_y + 8, 3, max_x, "STATUS HUIS   :", c_white)
     safe_box_str(stdscr, cur_y + 8, 19, max_x, "Wasmachine: ", c_grey)
     safe_box_str(stdscr, cur_y + 8, 31, max_x, f"[{wm_st}]", wm_col | curses.A_BOLD)
     safe_box_str(stdscr, cur_y + 8, 41, max_x, "│ Droger: ", c_grey)
     safe_box_str(stdscr, cur_y + 8, 51, max_x, f"[{dr_st}]", dr_col | curses.A_BOLD)
-    safe_box_str(stdscr, cur_y + 8, 61, max_x, f"│ Boiler: {b_pow:4.0f} W", c_grey)
+    if door_is_open:
+        m, s = divmod(door_secs, 60)
+        d_badge = f"[OPEN {m:02d}:{s:02d}]"
+        d_col = curses.color_pair(C_ALERT_EXTREME) if door_secs >= 600 else curses.color_pair(C_BADGE_REBOOT)
+    else:
+        d_badge = "[DICHT]"
+        d_col = curses.color_pair(C_BADGE_ONLINE)
+    safe_box_str(stdscr, cur_y + 8, 61, max_x, "│ Voordeur: ", c_grey)
+    safe_box_str(stdscr, cur_y + 8, 73, max_x, d_badge, d_col | curses.A_BOLD)
 
     cur_y += sec5_h
 
@@ -2089,6 +2138,45 @@ def render_portrait_dashboard(stdscr, collector, data):
             rendered_days += 1
 
     # ══════════════════════════════════════════════════════════════════════
+    # POPUP OVERLAY — VOORDEUR ALARM (Als deur >= 10 minuten open staat)
+    # ══════════════════════════════════════════════════════════════════════
+    ha_info = data.get("ha", {})
+    if ha_info.get("door_open_alert", False):
+        d_secs = ha_info.get("door_open_seconds", 600)
+        dm, ds = divmod(d_secs, 60)
+        pop_w = min(74, w - 4)
+        pop_h = 11
+        pop_x = max(2, (w - pop_w) // 2)
+        pop_y = max(4, (h - pop_h) // 2)
+
+        # Knipper effect (2 Hz)
+        is_flash = (int(time.time() * 2) % 2 == 0)
+        pop_col = curses.color_pair(C_DOOR_POPUP_RED) if is_flash else curses.color_pair(C_DOOR_POPUP_AMBER)
+        pop_attr = pop_col | curses.A_BOLD
+
+        # Achtergrond en rand vullen
+        for py in range(pop_y, pop_y + pop_h):
+            safe_addstr(stdscr, py, pop_x, " " * pop_w, pop_attr)
+
+        border_top = "╔" + ("═" * (pop_w - 2)) + "╗"
+        border_bot = "╚" + ("═" * (pop_w - 2)) + "╝"
+        safe_addstr(stdscr, pop_y, pop_x, border_top, pop_attr)
+        for py in range(pop_y + 1, pop_y + pop_h - 1):
+            safe_addstr(stdscr, py, pop_x, "║", pop_attr)
+            safe_addstr(stdscr, py, pop_x + pop_w - 1, "║", pop_attr)
+        safe_addstr(stdscr, pop_y + pop_h - 1, pop_x, border_bot, pop_attr)
+
+        line1 = "⚠️   ALARM: VOORDEUR STAAT OPEN!   ⚠️"
+        line2 = f"CONTACT SENSOR: TUYA DEUR (b5nfnb0yhzueptpt)"
+        line3 = f"DUUR: AL MEER DAN {dm} MINUTEN EN {ds:02d} SECONDEN OPEN!"
+        line4 = "CONTROLEER OF DE DEUR GOED IN HET SLOT VALT"
+
+        safe_addstr(stdscr, pop_y + 2, pop_x + max(1, (pop_w - len(line1)) // 2), line1, pop_attr)
+        safe_addstr(stdscr, pop_y + 4, pop_x + max(1, (pop_w - len(line2)) // 2), line2, pop_attr)
+        safe_addstr(stdscr, pop_y + 6, pop_x + max(1, (pop_w - len(line3)) // 2), line3, pop_attr)
+        safe_addstr(stdscr, pop_y + 8, pop_x + max(1, (pop_w - len(line4)) // 2), line4, pop_attr)
+
+    # ══════════════════════════════════════════════════════════════════════
     # ONDERAAN — FOOTER BALK (1 row)
     # ══════════════════════════════════════════════════════════════════════
     footer_y = h - 1
@@ -2139,7 +2227,8 @@ def main(stdscr):
         elif current_flash_state != last_flash_state:
             # Check of er een pulserend alarm actief is
             has_alarm = (
-                data.get("weather", {}).get("is_extreme", False)
+                data.get("ha", {}).get("door_open_alert", False)
+                or data.get("weather", {}).get("is_extreme", False)
                 or any(
                     (v.get("status", "").upper() in ("STOPPED", "OFFLINE") and not (v.get("lock") in ("reboot", "restart") or "reboot" in v.get("status", "").lower()))
                     or (v.get("cpu_pct", 0) >= 95.0 or (v.get("maxmem", 0) > 0 and (v.get("mem", 0) * 100.0 / v.get("maxmem", 1)) >= 95.0))
