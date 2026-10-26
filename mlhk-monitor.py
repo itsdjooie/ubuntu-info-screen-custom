@@ -100,6 +100,27 @@ def set_linux_console_palette():
             pass
 
 
+def play_hdmi_chime():
+    """Play subtle non-intrusive alert chime on the connected HDMI monitor speakers in background."""
+    def _play():
+        sound_file = "/usr/local/share/mlhk-monitor/sounds/chime.wav"
+        if os.path.exists(sound_file):
+            # Probeer HDMI audio van NVIDIA (card 1 dev 3 = plughw:1,3) of default
+            for dev in ["plughw:1,3", "default"]:
+                try:
+                    res = subprocess.run(
+                        ["/usr/bin/aplay", "-q", "-D", dev, sound_file],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3
+                    )
+                    if res.returncode == 0:
+                        break
+                except Exception:
+                    pass
+    threading.Thread(target=_play, daemon=True).start()
+
+
 def get_fbcon_rotation():
     try:
         with open("/sys/class/graphics/fbcon/rotate", "r", encoding="utf-8") as f:
@@ -2276,12 +2297,24 @@ def main(stdscr):
     render_portrait_dashboard(stdscr, collector, data)
 
     last_flash_state = -1
+    last_audio_chime_time = 0.0
 
     while True:
         now = time.monotonic()
         # Fast animation frame check for pulsing alarms (weather and VM offline/critical)
         current_flash_state = int(now * 2) % 2
         needs_render = False
+
+        # Audio alarm bij Escalatie 2 (>= 20 minuten open): speel chime elke 60 seconden
+        door_open_secs = data.get("ha", {}).get("door_open_seconds", 0)
+        door_is_open = data.get("ha", {}).get("door_open", False)
+        if door_is_open and door_open_secs >= 1200:
+            if now - last_audio_chime_time >= 60.0:
+                last_audio_chime_time = now
+                play_hdmi_chime()
+        else:
+            if not door_is_open:
+                last_audio_chime_time = 0.0
 
         if now - last_update >= REFRESH_INTERVAL:
             data = collector.collect()
